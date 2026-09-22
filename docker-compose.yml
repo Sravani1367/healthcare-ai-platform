@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: healthcare
+      POSTGRES_USER: healthcare
+      POSTGRES_PASSWORD: local-development-only
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U healthcare -d healthcare"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  mock-ehr:
+    build: .
+    command: uvicorn mock_ehr:ehr_app --host 0.0.0.0 --port 9000
+    volumes:
+      - mock_ehr_data:/app/data
+    environment:
+      MOCK_EHR_DB_PATH: /app/data/mock_ehr.db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      mock-ehr:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://healthcare:local-development-only@db:5432/healthcare
+      TOKEN_SECRET: ${TOKEN_SECRET:-replace-before-public-deployment}
+      MOCK_EHR_URL: http://mock-ehr:9000
+      ALLOW_DEMO_SEED: ${ALLOW_DEMO_SEED:-true}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM_EMAIL: ${RESEND_FROM_EMAIL:-Healthcare Platform <onboarding@resend.dev>}
+      TELEPHONE_WEBHOOK_SECRET: ${TELEPHONE_WEBHOOK_SECRET:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:8501}
+
+  frontend:
+    build: .
+    depends_on:
+      - api
+    command: streamlit run frontend.py --server.address 0.0.0.0 --server.port 8501
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE_URL: http://api:8000/api/v1
+      BROWSER_API_BASE_URL: ${BROWSER_API_BASE_URL:-http://localhost:8000/api/v1}
+
+volumes:
+  postgres_data:
+  mock_ehr_data:

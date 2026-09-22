@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font-family: Arial, sans-serif; background: #0f172a; }
+  .card { background: #0f172a; color: #f1f5f9; border: 1px solid #334155; border-radius: 10px; padding: 14px; box-sizing: border-box; }
+  .card strong { color: #f8fafc; }
+  #voice-status { color: #cbd5e1; }
+  button { border: none; border-radius: 6px; padding: 8px 14px; cursor: pointer; font-size: 14px; }
+  #voice-start { background: #2563eb; color: #fff; margin-right: 8px; }
+  #voice-start:disabled, #voice-stop:disabled { opacity: 0.5; cursor: not-allowed; }
+  #voice-stop { background: #334155; color: #fff; }
+  #voice-result { margin-top: 12px; white-space: pre-wrap; color: #f1f5f9; background: #1e293b; border-radius: 6px; padding: 10px; min-height: 20px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <strong>Web Voice Assistant</strong>
+    <p id="voice-status">Ready. Your browser performs speech recognition; the server uses the same safe agent and capabilities as text.</p>
+    <button id="voice-start">Start listening</button>
+    <button id="voice-stop">Stop / interrupt</button>
+    <div id="voice-result"></div>
+  </div>
+<script>
+(function() {
+  // Minimal implementation of Streamlit's bidirectional component postMessage
+  // protocol (streamlit:componentReady / streamlit:render / streamlit:setComponentValue
+  // / streamlit:setFrameHeight), matched directly against Streamlit's own frontend
+  // source. Implemented directly instead of via streamlit-component-lib because that
+  // package is ESM/React-only and cannot be loaded as a plain <script> tag.
+  const StreamlitBridge = {
+    _lastHeight: null,
+    send(type, extra) {
+      window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, extra), '*');
+    },
+    setComponentReady() {
+      this.send('streamlit:componentReady', {apiVersion: 1});
+    },
+    setFrameHeight(height) {
+      if (height === this._lastHeight) return;
+      this._lastHeight = height;
+      this.send('streamlit:setFrameHeight', {height});
+    },
+    setComponentValue(value) {
+      this.send('streamlit:setComponentValue', {value, dataType: 'json'});
+    },
+    onRender(callback) {
+      window.addEventListener('message', (event) => {
+        const data = event.data;
+        if (!data || data.type !== 'streamlit:render') return;
+        callback(data.args || {});
+      });
+    },
+  };
+
+  let args = {};
+  let conversationId = null;
+  let ready = false;
+
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const status = document.getElementById('voice-status');
+  const resultBox = document.getElementById('voice-result');
+  const startBtn = document.getElementById('voice-start');
+  const stopBtn = document.getElementById('voice-stop');
+  let recognition = Recognition ? new Recognition() : null;
+  let controller = null;
+
+  if (!recognition) {
+    status.textContent = 'Speech recognition is not supported in this browser. Use the text assistant below.';
+    startBtn.disabled = true;
+  }
+
+  function sendConversationId() {
+    // Reported back to Python as this component's value; triggers a rerun
+    // so the text assistant tab shares the same conversation thread.
+    StreamlitBridge.setComponentValue({conversation_id: conversationId});
+  }
+
+  if (recognition) {
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.onstart = () => status.textContent = 'Listening…';
+    recognition.onspeechend = () => status.textContent = 'Transcribing…';
+    recognition.onresult = async (event) => {
+      const transcript = Array.from(event.results).map(r => r[0].transcript).join('');
+      if (!event.results[event.results.length - 1].isFinal) { resultBox.textContent = transcript; return; }
+      status.textContent = 'Thinking / executing…';
+      controller = new AbortController();
+      try {
+        const response = await fetch(args.api_base + '/voice/turn', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + args.token},
+          body: JSON.stringify({transcript, conversation_id: conversationId}),
+          signal: controller.signal,
+        });
+        const data = await response.json();
+        conversationId = data.conversation_id || conversationId;
+        sendConversationId();
+        resultBox.textContent = data.text || JSON.stringify(data);
+        status.textContent = 'Speaking…';
+        if (window.speechSynthesis && data.text) speechSynthesis.speak(new SpeechSynthesisUtterance(data.text));
+        setTimeout(() => { if (status.textContent === 'Speaking…') status.textContent = 'Ready'; }, 500);
+      } catch (error) {
+        status.textContent = error.name === 'AbortError' ? 'Interrupted' : 'Voice turn failed';
+      }
+    };
+    recognition.onerror = () => status.textContent = 'Voice capture failed. Text remains available.';
+  }
+
+  startBtn.onclick = () => recognition && recognition.start();
+  stopBtn.onclick = () => {
+    if (recognition) recognition.stop();
+    if (controller) controller.abort();
+    if (window.speechSynthesis) speechSynthesis.cancel();
+    status.textContent = 'Interrupted';
+  };
+
+  StreamlitBridge.onRender((renderArgs) => {
+    args = renderArgs;
+    if (!ready) {
+      conversationId = args.conversation_id || null;
+      ready = true;
+    }
+    StreamlitBridge.setFrameHeight(document.documentElement.scrollHeight || 220);
+  });
+
+  StreamlitBridge.setComponentReady();
+  StreamlitBridge.setFrameHeight(220);
+})();
+</script>
+</body>
+</html>
